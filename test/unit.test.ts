@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { due } from "../src/cli";
+import { checkpointFallback, checkpointRecoveryBody, due, recordRunLimit } from "../src/cli";
 import { matches, signature, type Cfg } from "../src/core";
-import { cliCommand, parseResult, runAgent, stripImages } from "../src/runner";
+import { RUN_LIMIT, cliCommand, deadlinePrompt, parseResult, runAgent, runLimits, stripImages } from "../src/runner";
+import { tooManyWakes } from "../src/waits";
 
 test("routine schedule", () => {
   const t = new Date("2026-11-02T19:05:00"); // Monday
@@ -38,9 +39,63 @@ test("result parsing", () => {
   expect(parseResult('{"status":"done","summary":"ok"}').status).toBe("done");
 });
 
+test("result parsing keeps a lone backslash such as a Windows drive path", () => {
+  const out = '```json\n{"status":"done","summary":"can\'t reach D:\\、USB drives"}\n```';
+  expect(parseResult(out)).toMatchObject({ status: "done", summary: "can't reach D:\\、USB drives" });
+});
+
 test("result parsing repairs a raw line break inside a JSON string", () => {
   const out = '```json\n{"status":"delegated","summary":"ok","followups":[{"title":"x","body":"line one\n","agent":"a"}]}\n```';
   expect(parseResult(out)).toMatchObject({ status: "delegated", followups: [{ title: "x", body: "line one\n", agent: "a" }] });
+});
+
+test("long runs reserve a checkpoint window before the hard limit", () => {
+  const limits = runLimits({ clis: { timeout_minutes: 90 } } as Cfg, 0);
+  expect(limits).toEqual({
+    totalMinutes: 90,
+    workMinutes: 80,
+    checkpointMinutes: 10,
+    checkpointAt: "1970-01-01T01:20:00.000Z",
+    hardAt: "1970-01-01T01:30:00.000Z",
+  });
+  expect(runLimits({ clis: { timeout_minutes: 90, checkpoint_minutes: 15 } } as Cfg, 0).workMinutes).toBe(75);
+  expect(runLimits({ clis: { timeout_minutes: 29 } } as Cfg, 0).checkpointMinutes).toBe(0);
+  expect(runLimits({ clis: { timeout_minutes: 15, checkpoint_minutes: 5 } } as Cfg, 0).workMinutes).toBe(10);
+  expect(runLimits({ clis: { timeout_minutes: 90, checkpoint_minutes: 0 } } as Cfg, 0).checkpointMinutes).toBe(0);
+});
+
+test("every task prompt states the checkpoint and hard deadlines", () => {
+  const cfg = { clis: { timeout_minutes: 90 }, owner: { name: "owner" } } as Cfg;
+  const prompt = deadlinePrompt(runLimits(cfg, 0));
+  expect(prompt).toContain("90-minute hard limit");
+  expect(prompt).toContain("1970-01-01T01:20:00.000Z");
+  expect(prompt).toContain("1970-01-01T01:30:00.000Z");
+  expect(prompt).toContain("return `waiting` with a quick read-only `wait_check`");
+});
+
+test("checkpoint fallback parks with an executable time-based wait_check", () => {
+  expect(checkpointFallback("T-1", "/tmp/run.log", 300_000)).toMatchObject({
+    status: "waiting",
+    wait_kind: "ci",
+    wait_minutes: 5,
+    wait_check: 'test "$(date +%s)" -ge 300',
+  });
+});
+
+test("work-limit resumes use a separate counter with the MAX_WAKES safety cap", () => {
+  const meta: Record<string, string> = {};
+  for (let hit = 1; hit <= 6; hit++) expect(tooManyWakes(recordRunLimit(meta))).toBe(false);
+  expect(tooManyWakes(recordRunLimit(meta))).toBe(true);
+  expect(meta.run_limits).toBe("7");
+});
+
+test("result parsing repairs a bare double quote inside a JSON string", () => {
+  // a real run (T-0016, 2026-11-16) was requeued and re-run because of this one line
+  const out = '```json\n{"status":"done","summary":"ok","lessons":["旧的两条"压到一条绑 2FA"仍在和新结论打架。"]}\n```';
+  expect(parseResult(out)).toMatchObject({ status: "done", lessons: ['旧的两条"压到一条绑 2FA"仍在和新结论打架。'] });
+  // escaped quotes and nested objects must keep parsing as before
+  const ok = '```json\n{"status":"done","summary":"say \\"hi\\"","followups":[{"title":"x"}]}\n```';
+  expect(parseResult(ok)).toMatchObject({ status: "done", summary: 'say "hi"', followups: [{ title: "x" }] });
 });
 
 test("owner image uploads: images only, 10 MB, attachments are the hub's own media", async () => {
@@ -159,6 +214,16 @@ test("selfUpdate defers while tasks run on this host", async () => {
   expect(await selfUpdate({ busy: 2 })).toBe(false);
 });
 
+test("a blocked self-update is reported once per distinct state", async () => {
+  const { join } = await import("node:path");
+  const { updateBlocked } = await import("../src/setup");
+  const f = join(mkdtempSync(join(tmpdir(), "noop-blocked-")), "update-blocked");
+  const dirty = "local edits: src/accounts.ts (HEAD aaaa, origin bbbb)";
+  expect(updateBlocked(dirty, f)).toBe(dirty); // first sighting → the caller journals it
+  expect(updateBlocked(dirty, f)).toBeNull(); // same state every 30 min → one line, not a flood
+  expect(updateBlocked("local edits: src/accounts.ts, src/cli.ts (HEAD aaaa, origin bbbb)", f)).not.toBeNull(); // a new edit is news
+});
+
 test("a release whose tests failed here is not installed again until origin moves on", async () => {
   const { mkdtempSync, writeFileSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
@@ -237,7 +302,7 @@ test("pickTask: a task no machine here can run (needs another OS) never holds ba
 });
 
 test("a reply to an agent's message goes to the brain with that task, never as an amendment of the last decision", async () => {
-  const { handleOwnerMessage, setOwnerTask, drainInbound } = await import("../src/server");
+  const { handleOwnerMessage, setOwnerTask, pendingInbound, ackInbound } = await import("../src/server");
   const calls: [string, { reply?: string; answered?: string }][] = [];
   setOwnerTask(async (text, o) => { calls.push([text, { reply: o.reply, answered: o.answered }]); });
   await handleOwnerMessage("D-0001 A"); // just answered a decision: the brain hears it may be amended
@@ -245,11 +310,12 @@ test("a reply to an agent's message goes to the brain with that task, never as a
   expect(calls).toEqual([["为何我看图片不清晰呢", { reply: "T-0125", answered: undefined }]]);
   await handleOwnerMessage("等等，选 B");
   expect(calls.at(-1)).toEqual(["等等，选 B", { reply: undefined, answered: "D-0001" }]);
-  expect(drainInbound()).toEqual([{ id: "D-0001", answer: "A", source: "chat" }]);
+  expect(pendingInbound()).toEqual([{ id: "D-0001", answer: "A", source: "chat" }]);
+  ackInbound(1);
 });
 
 test("an answer in words to a proposals card goes to the brain; numbers, all and none go straight to the card", async () => {
-  const { handleOwnerMessage, setOwnerTask, drainInbound } = await import("../src/server");
+  const { handleOwnerMessage, setOwnerTask, pendingInbound, ackInbound } = await import("../src/server");
   const calls: string[] = [];
   setOwnerTask(async (text) => { calls.push(text); });
   await handleOwnerMessage("只做文档那项，另一个先不做", "P-0005");
@@ -257,7 +323,8 @@ test("an answer in words to a proposals card goes to the brain; numbers, all and
   await handleOwnerMessage("1，3", "P-0008");
   await handleOwnerMessage("P-0009 all");
   expect(calls).toEqual(["P-0005 只做文档那项，另一个先不做", "P-0006 1、不做 2、做"]);
-  expect(drainInbound()).toEqual([{ id: "P-0008", answer: "1，3", source: "chat" }, { id: "P-0009", answer: "all", source: "chat" }]);
+  expect(pendingInbound()).toEqual([{ id: "P-0008", answer: "1，3", source: "chat" }, { id: "P-0009", answer: "all", source: "chat" }]);
+  ackInbound(2);
 });
 
 test("a result block survives a later turn from a background task notification", async () => {
@@ -365,6 +432,47 @@ test("a run that never reached the API is retried once instead of failing the ta
     rmSync(dir, { recursive: true, force: true });
   }
 }, 20_000);
+
+test("a run stopped by its work limit uses a distinct checkpoint marker", async () => {
+  const dir = mkdtempSync(`${tmpdir()}/noop-run-limit-`);
+  const script = `setTimeout(() => {}, 5000)`;
+  const cfg = { clis: { fake: { command: [process.execPath, "-e", script] }, timeout_minutes: 0.001 } } as unknown as Cfg;
+  const log = `${dir}/run.log`;
+  try {
+    const out = await runAgent("fake", "prompt", dir, cfg, log);
+    expect(out).toContain(RUN_LIMIT);
+    expect(out).not.toContain("[stalled]");
+    expect(readFileSync(log, "utf8")).toContain("[stderr]");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("a work-limit run hands off to a checkpoint-only run end to end", async () => {
+  const dir = mkdtempSync(`${tmpdir()}/noop-checkpoint-e2e-`);
+  const script = `let input = "";
+process.stdin.on("data", chunk => input += chunk);
+process.stdin.on("end", () => {
+  if (input.includes("# Checkpoint-only recovery")) {
+    console.log('\`\`\`json\\n{"status":"waiting","wait_kind":"ci","wait_minutes":5,"wait_check":"test -f /tmp/noop-ready","waiting_on":"saved checkpoint","summary":"progress saved"}\\n\`\`\`');
+  } else setTimeout(() => {}, 5000);
+});`;
+  const workCfg = { clis: { fake: { command: [process.execPath, "-e", script] }, timeout_minutes: 0.001 } } as unknown as Cfg;
+  const checkpointCfg = { clis: { fake: { command: [process.execPath, "-e", script] }, timeout_minutes: 1 } } as unknown as Cfg;
+  const workLog = `${dir}/work.log`;
+  const checkpointLog = `${dir}/checkpoint.log`;
+  try {
+    const work = await runAgent("fake", "do work", dir, workCfg, workLog);
+    expect(work).toContain(RUN_LIMIT);
+    const body = checkpointRecoveryBody("do work", workLog, Date.now() + 300_000, 5);
+    const checkpoint = parseResult(await runAgent("fake", body, dir, checkpointCfg, checkpointLog));
+    expect(checkpoint).toMatchObject({ status: "waiting", wait_kind: "ci", wait_minutes: 5, waiting_on: "saved checkpoint" });
+    expect(checkpoint.wait_check).toBe("test -f /tmp/noop-ready");
+    expect(readFileSync(checkpointLog, "utf8")).toContain("progress saved");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 5_000);
 
 test("a failed run that already did work is not retried, however its text reads", async () => {
   // The medic reports connection errors in its own result text. Replaying a run that ran a tool would repeat its
@@ -540,6 +648,23 @@ test("a model-emitted followup without a title cannot abort the run", async () =
   expect(asText({ a: 1 })).toBe('{"a":1}');
 });
 
+test("a followup whose requires is a list or another non-string cannot abort the run", async () => {
+  const { newTask, readDoc, P } = await import("../src/core");
+  const read = (id: string) => readDoc(P("tasks", "inbox", `${id}.md`)).meta;
+  // an agent told "leave requires empty" sent `"requires": []`; `.split` on an array killed the worker three times
+  // (each time after a long run, so the whole run was requeued)
+  expect(read(newTask("empty list", "", { requires: [] as any })).requires).toBe("");
+  expect(read(newTask("listed", "", { requires: ["os:windows", " cli:claude "] as any })).requires).toBe("os:windows,cli:claude");
+  expect(read(newTask("string still works", "", { requires: "os:macos, host:Mac" })).requires).toBe("os:macos,host:Mac");
+  // the other string-typed fields come from the same untrusted JSON
+  const odd = read(newTask("odd fields", "", { requires: 7 as any, repo: [] as any, agent: 3 as any, host: ["a"] as any, priority: { p: 1 } as any }));
+  expect(odd.requires).toBe("7");
+  expect(odd.repo).toBe("");
+  expect(odd.agent).toBe("3");
+  expect(odd.host).toBe("a");
+  expect(odd.priority).toBe('{"p":1}');
+});
+
 test("lessons sent as a bare string are kept, not fatal", async () => {
   const { readIf, remember, P } = await import("../src/core");
   const dir = P("agents", "crashguard-test", "memory.md");
@@ -554,4 +679,13 @@ test("lessons sent as a bare string are kept, not fatal", async () => {
   rmSync(dir, { force: true });
   expect(() => remember("crashguard-test", undefined, "T-3")).not.toThrow();
   expect(() => remember("crashguard-test", { length: 2 } as any, "T-4")).not.toThrow(); // no write, no crash
+});
+
+test("runsCheckHere: the host that parked a wait runs its check; the primary runs the rest it can", async () => {
+  const { runsCheckHere } = await import("../src/cli");
+  const mac = { host_caps: "os:macos,host:mbp", wait_check: "test -f /Users/j/done" };
+  expect(runsCheckHere(mac, "mbp", false, "linux")).toBe(true);
+  expect(runsCheckHere(mac, "lb", true, "linux")).toBe(false); // macOS path: the primary can't answer it
+  expect(runsCheckHere({ host_caps: "host:mbp", wait_check: "gh pr checks 1 -R o/r" }, "lb", true, "linux")).toBe(true);
+  expect(runsCheckHere({ host_caps: "host:mbp", wait_check: "gh pr checks 1 -R o/r" }, "win", false, "linux")).toBe(false);
 });

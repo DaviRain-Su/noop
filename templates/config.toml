@@ -36,6 +36,8 @@ stale_repo_days = 7                   # target/ of repos (and, on macOS, Xcode D
 # Claude Opus = challenging work (development, debugging, architecture, UI, judge, learning, evolution).
 # Codex (ChatGPT) = routine work. The planner only suggests, so it can never override a member pinned here.
 timeout_minutes = 90
+# Runs of 30+ minutes reserve 10 minutes for checkpoint recovery by default. Set 0 to disable or another value to override.
+# checkpoint_minutes = 10
 [clis.agents]
 # reviewer = ["codex", "claude"]      # per-member order; ["codex"] = codex only (unless codex has no usable account)
 [clis.claude]
@@ -106,6 +108,8 @@ extra = []                            # more Claude Code tool patterns to hard-b
 
 # ------------------------------------------------------------------ routines (signal → task generators)
 # every: "15m" | "hourly" | "daily HH:MM" | "weekdays HH:MM" | "weekly MON HH:MM"
+# skip_while_decision_open = true: while a previous copy of this routine waits on an unanswered decision, do not start
+# new copies (each would only repeat the same report); the parked copy resumes when the owner answers.
 # More examples (PR review, CI, uptime, nightly builds): presets/routines.toml in the Noop code.
 # requires = hard capability (task waits for such a host) ; prefer = soft (falls back to anyone)
 

@@ -53,12 +53,21 @@ export function classify(t: Task, ctx: Ctx): Verdict | null {
   // 2. blocked on a card that is already closed → the answer never reached it
   if (t.folder === "blocked" && m.decision && ctx.decision(m.decision) === "closed") return v(`answered:${m.decision}`, "resume", [L(`${m.decision} was answered but the task did not continue`, `${m.decision} 已回答但任务没有继续`)]);
   if (t.folder === "blocked" && m.decision && ctx.decision(m.decision) === "open") return null; // the owner has the card
+  // 2b. parked on the owner: a human wait is a state, not a stall. waits.ts gives it no deadline and no timer, so a
+  // clock-based card here would only add a second unanswered card about the first one (2026-11-14: 167 identical
+  // "long run on <host>" cards, every one a routine copy waiting on the same unanswered card).
+  if (m.wait_kind === "human") return null;
+  if (t.folder === "blocked" && (m.waiting_on ?? "").match(/D-\d+/g)?.some((id) => ctx.decision(id) === "open")) return null;
+  // a wake the runner already scheduled is progress too (CI waits cap at 120 minutes in waits.ts)
+  if (m.wake_at && Date.parse(m.wake_at) > ctx.now) return null;
   const age = (ctx.now - startedAt(m)) / 3_600_000;
   const wakes = Number(m.wakes ?? 0);
   const reasons: string[] = [];
   if (age >= ctx.maxAgeHours) reasons.push(L(`waiting ${Math.floor(age)} hours`, `已等待 ${Math.floor(age)} 小时`));
   if (wakes >= ctx.maxWakes) reasons.push(L(`woken ${wakes} times`, `唤醒 ${wakes} 次`));
-  if (checkUnrunnable(m.wait_check, ctx.primaryOs)) reasons.push(L("the wait check cannot run on the primary, so it will never fire", "等待检查命令在主控机上无法运行，永远不会触发"));
+  // the host that parked the wait runs its own check (cli.ts runsCheckHere), so only a hostless wait is stuck
+  const parkedOn = (m.host_caps ?? "").split(",").find((c) => c.startsWith("host:"))?.slice(5);
+  if (!parkedOn && checkUnrunnable(m.wait_check, ctx.primaryOs)) reasons.push(L("the wait check cannot run on the primary, so it will never fire", "等待检查命令在主控机上无法运行，永远不会触发"));
   // 3. waits on nothing: requeue once so the agent re-decides; the second time it is a card
   if (!m.waiting_on && !m.wait_check && t.folder === "waiting") {
     if (m.supervisor_requeued) return v("no-wait", "escalate", [L("nothing recorded as being waited on", "没有记录在等什么"), ...reasons]);
@@ -82,7 +91,8 @@ export function classify(t: Task, ctx: Ctx): Verdict | null {
 export function sweepPlatform(tasks: Task[], vs: Verdict[]): Verdict[] {
   const causes = new Set(vs.filter((v) => v.action === "escalate" && v.cause.startsWith("platform:")).map((v) => v.cause));
   const have = new Set(vs.map((v) => v.id));
-  return tasks.filter((t) => t.folder === "waiting" && !t.meta.children && !have.has(t.meta.id) && causes.has(`platform:${platform(t.meta)}`))
+  // a task parked on the owner is not evidence that its platform is missing (T-1477)
+  return tasks.filter((t) => t.folder === "waiting" && !t.meta.children && t.meta.wait_kind !== "human" && !have.has(t.meta.id) && causes.has(`platform:${platform(t.meta)}`))
     .map((t) => ({ id: t.meta.id, cause: `platform:${platform(t.meta)}`, reasons: [L(`also needs ${platform(t.meta)}`, `同样需要 ${platform(t.meta)}`)], action: "escalate" as const }));
 }
 
@@ -140,11 +150,27 @@ function prState(ref: string): string {
   try { return Bun.spawnSync(["gh", "pr", "view", n, "-R", repo, "--json", "state", "-q", ".state"], { stdout: "pipe", stderr: "ignore" }).stdout.toString().trim(); } catch { return ""; }
 }
 
+/** Head-commit workflow runs that will never start on their own: GitHub holds them until a maintainer clicks
+    "Approve and run" (fork/first-time contributors, protected environments). One graphql call per PR. */
+function ciNeedsApproval(ref: string): boolean {
+  const [full, n] = ref.split("#");
+  const [owner, name] = full.split("/");
+  const q = `{repository(owner:"${owner}",name:"${name}"){pullRequest(number:${Number(n)}){state commits(last:1){nodes{commit{checkSuites(first:50){nodes{status conclusion}}}}}}}}`;
+  try {
+    const out = Bun.spawnSync(["gh", "api", "graphql", "-f", `query=${q}`], { stdout: "pipe", stderr: "ignore" }).stdout.toString();
+    const pr = JSON.parse(out)?.data?.repository?.pullRequest;
+    return pr?.state === "OPEN" && approvalPending(pr.commits?.nodes?.[0]?.commit?.checkSuites?.nodes ?? []);
+  } catch { return false; }
+}
+/** Pure: unit-tested. */
+export const approvalPending = (suites: { status?: string; conclusion?: string | null }[]) =>
+  suites.some((x) => x.status === "WAITING" || x.conclusion === "ACTION_REQUIRED");
+
 // ------------------------------------------------------------------ IO: one supervisor pass over the hub
 const decisionState = (id: string) => existsSync(P("decisions", "open", `${id}.md`)) ? "open" as const
   : existsSync(P("decisions", "closed", `${id}.md`)) ? "closed" as const : undefined;
 
-export function supervise(cfg: Cfg, host: string, t = Date.now(), readPrState = prState) {
+export function supervise(cfg: Cfg, host: string, t = Date.now(), readPrState = prState, needsApproval = ciNeedsApproval) {
   const s = cfg.supervisor ?? {};
   const retired: string[] = s.retired_hosts ?? cfg.fleet?.retired_hosts ?? [];
   const ctx: Ctx = {
@@ -166,6 +192,19 @@ export function supervise(cfg: Cfg, host: string, t = Date.now(), readPrState = 
     unlinkSync(task.path);
     tasks.splice(tasks.indexOf(task), 1);
     journal(host, L(`🧭 supervisor: ${task.meta.id} resumed, ${prs.join(", ")} already merged`, `🧭 supervisor: ${task.meta.id} 唤醒核对收尾，${prs.join("、")} 已合并`)); merged++;
+  }
+  for (const task of tasks) { // A machine wait on CI that GitHub holds for approval never ends by itself: tell the owner once.
+    const m = task.meta;
+    if (task.folder !== "waiting" || m.children || m.wait_kind === "human") continue;
+    const prs = trackedPrs(m, task.body);
+    const held = prs.filter((r) => needsApproval(r));
+    const sig = held.slice().sort().join(",");
+    if (!held.length) continue;
+    const urls = held.map((r) => `https://github.com/${r.replace("#", "/pull/")}`).join(" ");
+    const on = L(`approve and run the PR's CI on GitHub: ${urls}`, `在 GitHub 上批准运行 PR 的 CI（Approve and run）：${urls}`);
+    writeDoc(task.path, { ...m, wait_kind: "human", wake_at: undefined, waiting_on: `${on}${m.waiting_on ? ` — ${m.waiting_on}` : ""}`, supervisor_ci_approval: sig }, task.body ?? "");
+    tasks.splice(tasks.indexOf(task), 1, { ...task, meta: { ...m, wait_kind: "human" } });
+    journal(host, L(`⏳ ${m.id} waiting on you: ${on} (CI has not started; the task continues once it runs)`, `⏳ ${m.id} 等你处理：${on}（CI 还没开始跑，批准后任务自动继续）`));
   }
   for (const task of tasks) {
     const v = classify(task, ctx);

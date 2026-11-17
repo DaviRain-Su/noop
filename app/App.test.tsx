@@ -563,12 +563,15 @@ describe("channel", () => {
     expect(app.openedUrls()).toEqual(["https://github.com/acme/nsh/issues/1394"]);
   });
 
-  test("an answer quotes the card it replies to; pressing the quote goes back to the card", async () => {
+  test("an answer quotes the card it replies to; pressing the quote previews it, Go to message goes back", async () => {
     const reply = { id: "e9", ts: ts(9), from: "owner", kind: "owner", ref: "D-0001", text: "B，但先跑一遍测试" };
     const app = await open("./App.tsx", { storage: STORAGE, network: hub([], [reply]), width: 1200, height: 800, platform: "macos" });
     await app.waitFor("id:reply-to-D-0001");
     expect(app.shows("text:要不要升级依赖？建议：B >> nth=1")).toBe(true);
     await app.press("id:reply-to-D-0001");
+    await app.waitFor("id:reply-preview-D-0001");
+    await app.press("id:reply-goto-D-0001");
+    await app.waitUntil(() => !app.shows("id:reply-preview-D-0001"));
   });
 
   test("answers a decision with one tap", async () => {
@@ -1089,6 +1092,32 @@ describe("images", () => {
     await app.waitUntil(() => posts.length === 1, { timeout: 8000 });
     expect(uploads.length).toBe(1);
     expect(posts[0]).toMatchObject({ text: "看这个报错", attachments: ["/media/shot-1.png"] });
+  });
+
+  test("a composer thumbnail opens the full-size viewer, pages through the attached images, and still removes", async () => {
+    const app = await open("./App.tsx", { ...desk, network: withUploads([], []) });
+    await app.waitFor("id:composer");
+    await app.dropFiles("id:drop-window", [`file://${here("icon.png")}`]);
+    await app.waitFor("id:attachment");
+    await app.dropFiles("id:drop-window", [`file://${here("icon.png")}`]);
+    await app.waitUntil(() => app.count("id:attachment") === 2);
+    // pressing the picture, not the close button, is what opens it
+    await app.press("label:View icon.png >> nth=0");
+    await app.waitFor("text:1 / 2");
+    await app.press("id:image-next");
+    await app.waitFor("text:2 / 2");
+    await app.press("label:Close image >> nth=0");
+    await app.waitUntil(() => !app.shows("text:1 / 2"));
+    expect(app.count("id:attachment")).toBe(2);
+    // reopening on the second picture starts there, not back at the first
+    await app.press("label:View icon.png >> nth=1");
+    await app.waitFor("text:2 / 2");
+    await app.press("label:Close image >> nth=0");
+    await app.waitUntil(() => !app.shows("text:2 / 2"));
+    // the close button still removes the attachment
+    await app.press("label:Remove icon.png >> nth=1");
+    expect(app.count("id:attachment")).toBe(1);
+    expect(app.shows("id:image-viewer")).toBe(false); // removing is not a press on the picture
   });
 
   test("undo brings the image back to the composer; nothing is uploaded", async () => {

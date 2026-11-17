@@ -39,7 +39,7 @@ import {
   windowSize, token, openUrl, keyboardFrame, Keyboard, Picker, Speech, Clipboard, Notifications } from "nsh";
 import fs from "fs/promises";
 import type { InputRef, JSX, ScrollRef, SpeechSession, ViewStyle } from "nsh";
-import { AlertDialog, Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious, Toast, ToastStack, Button as BaseButton, ContextMenu, Dialog, Menu, MenuItem, Submenu, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, Sheet, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline } from "nsh/base";
+import { AlertDialog, Popover, Carousel, CarouselContent, CarouselItem, CarouselNext, CarouselPrevious, Toast, ToastStack, Button as BaseButton, ContextMenu, Dialog, Menu, MenuItem, Submenu, Input, NavPage, NavStack, NumberInput, Radio, RadioGroup, Scrollbar, Sheet, TextView, createNavStack, type MarkdownExtension, type TextViewBlock, type TextViewCustomNode, type TextViewInline } from "nsh/base";
 // MenuButton and SegmentedControl through the namespaces: runtimes before NSH's native iOS controls (longbridge/nsh#1736)
 // lack these exports, and a missing named import would fail to link. Without them iOS keeps the drawn menu and choices.
 import * as nshBase from "nsh/base";
@@ -104,6 +104,7 @@ import {
   MenuSep,
   MenuPanel,
   PopIn,
+  popupSurface,
   menuBox,
   menuEnter,
   menuRowHover,
@@ -249,6 +250,10 @@ const ipBlocked = (status: number, data: unknown): string | null =>
 
 /** Failed reconnects in a row before the owner hears about it; anything shorter recovers silently. */
 const OFFLINE_AFTER = 5;
+/** Heartbeat: a socket can die silently (sleep, network switch, idle NAT timeout) and never fire `close`, leaving the
+ * chat "live" but frozen. Ping on this interval; no frame back within STALE_AFTER means the socket is dead. */
+const PING_EVERY = 25_000;
+const STALE_AFTER = 60_000;
 
 function createHub(cfg: Config) {
   const events = signal<HubEvent[]>([]);
@@ -261,6 +266,7 @@ function createHub(cfg: Config) {
   let socket: WebSocket | null = null;
   let retry: ReturnType<typeof setTimeout> | undefined;
   let failures = 0;
+  let lastFrame = 0;
 
   const last = () => {
     const evs = untracked(events);
@@ -299,10 +305,13 @@ function createHub(cfg: Config) {
     socket = ws;
     ws.onopen = () => {
       failures = 0;
+      lastFrame = Date.now();
       conn.set("live");
       loadStatus(); // whatever changed while disconnected; from here on the hub pushes it
     };
     ws.onmessage = (m: { data: unknown }) => {
+      if (ws === socket) lastFrame = Date.now();
+      if (m.data === "pong") return;
       try {
         const d = JSON.parse(String(m.data)) as HubEvent & { $status?: Status };
         if (d.$status) status.set(d.$status);
@@ -312,8 +321,10 @@ function createHub(cfg: Config) {
       }
     };
     ws.onclose = () => {
-      if (disposed) return;
+      if (disposed || ws !== socket) return; // a socket replaced by `revive` already reconnected
+      socket = null;
       if (++failures >= OFFLINE_AFTER && untracked(conn) !== "unauthorized" && untracked(conn) !== "blocked") conn.set("offline");
+      clearTimeout(retry);
       retry = setTimeout(async () => {
         await loadFeed();
         stream();
@@ -378,13 +389,43 @@ function createHub(cfg: Config) {
     }
   }
 
+  /** Drops a silently dead socket and reconnects at once, catching up on what was missed. */
+  function revive() {
+    const dead = socket;
+    socket = null;
+    try { dead?.close(); } catch { /* already gone */ }
+    clearTimeout(retry);
+    void loadFeed().then(stream);
+  }
+
+  /** The socket's health: ping it, and replace it when nothing (pong or event) came back in time. */
+  function heartbeat() {
+    if (disposed || !socket || socket.readyState !== 1) return;
+    if (Date.now() - lastFrame > STALE_AFTER) return revive();
+    try { socket.send("ping"); } catch { revive(); }
+  }
+
   loadFeed().then(stream);
   loadStatus();
+  const pinger = setInterval(heartbeat, PING_EVERY);
+  // back from the background (or a sleeping laptop): fetch what was missed and check the socket right away
+  effect(() => {
+    if (lifecycle() !== "active") return;
+    untracked(() => {
+      if (disposed) return;
+      void loadFeed();
+      if (socket?.readyState !== 1 || Date.now() - lastFrame < PING_EVERY) return;
+      const sent = Date.now();
+      try { socket.send("ping"); } catch { return revive(); }
+      setTimeout(() => !disposed && lastFrame < sent && revive(), 10_000); // a live socket answers well within this
+    });
+  });
   // the socket pushes the dashboard; only without it does the app poll, and slowly (Cloudflare free plan)
   const timer = setInterval(() => untracked(conn) !== "live" && loadStatus(), 120_000);
   const dispose = () => {
     disposed = true;
     clearInterval(timer);
+    clearInterval(pinger);
     clearTimeout(retry);
     socket?.close();
   };
@@ -420,6 +461,8 @@ function toggleTheme() {
 
 /** Shared edge for controls and grouped settings surfaces. */
 const surfaceEdge = () => colors.line;
+/** The report reader's width when it first opens. */
+const READER_WIDTH = 760;
 
 /** Links use a quiet, underlined accent shared by the app's themes. */
 const linkColor = () => token("link");
@@ -711,7 +754,7 @@ function Media(props: { hub: Hub; path: string; /** Every attachment of its mess
         backdropClass="bg-scrim"
         style={{ flex: 1, padding: 24, pointerEvents: "box-none" }}
       >
-        <ImagePager hub={props.hub} paths={images()} start={Math.max(0, images().indexOf(props.path))} onClose={() => zoomed.set(false)} />
+        <ImagePager urls={images().map((p) => mediaUrl(props.hub.cfg.url, props.hub.cfg.token, p))} start={() => Math.max(0, images().indexOf(props.path))} onClose={() => zoomed.set(false)} />
       </Dialog>
     </If>
   );
@@ -747,24 +790,27 @@ function FileAttachment(props: { src: string; name: string }) {
 }
 
 /**
- * A message's images full size, paged in a loop (NSH's `Carousel`): swipe, the arrow keys or the side buttons move
- * on, past the last back to the first; a press on the image closes it.
+ * Images full size, paged in a loop (NSH's `Carousel`): swipe, the arrow keys or the side buttons move on, past the
+ * last back to the first; a press on the image closes it. A message's attachments and the composer's own thumbnails
+ * both open it, so it takes ready URLs rather than hub paths.
  */
-function ImagePager(props: { hub: Hub; paths: string[]; start: number; onClose: () => void }) {
-  const index = signal(props.start);
-  const many = props.paths.length > 1;
+function ImagePager(props: { urls: string[]; start: () => number; onClose: () => void }) {
+  const index = signal(props.start());
+  // the viewer stays mounted between openings: follow the image the caller last pressed
+  effect(() => index.set(props.start()));
+  const many = props.urls.length > 1;
   const side = (left: boolean): ViewStyle => ({
     position: "absolute", top: "50%", marginTop: -20, [left ? "left" : "right"]: 8, width: 40, height: 40, borderRadius: 20,
     alignItems: "center", justifyContent: "center", backgroundColor: alpha("#000000", 0.45), cursor: "pointer",
   });
   return (
-    <Carousel index={index()} looping onChange={({ index: i }) => index.set(i)} accessibilityLabel={L("Images", "图片")} style={{ flex: 1 }}>
+    <Carousel testID="image-viewer" index={index()} looping onChange={({ index: i }) => index.set(i)} accessibilityLabel={L("Images", "图片")} style={{ flex: 1 }}>
       <CarouselContent style={{ flex: 1 }}>
-        <Each of={props.paths}>
+        <Each of={props.urls}>
           {(p, i) => (
-            <CarouselItem accessibilityLabel={`${i() + 1} / ${props.paths.length}`} style={{ width: "100%", height: "100%" }}>
+            <CarouselItem accessibilityLabel={`${i() + 1} / ${props.urls.length}`} style={{ width: "100%", height: "100%" }}>
               <View accessibilityLabel={L("Close image", "关闭大图")} onPress={props.onClose} style={{ flex: 1, alignItems: "center", justifyContent: "center", cursor: "zoom-out" }}>
-                <Image src={mediaUrl(props.hub.cfg.url, props.hub.cfg.token, p())} style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                <Image src={p()} style={{ width: "100%", height: "100%", objectFit: "contain" }} />
               </View>
             </CarouselItem>
           )}
@@ -774,7 +820,7 @@ function ImagePager(props: { hub: Hub; paths: string[]; start: number; onClose: 
         <CarouselPrevious testID="image-prev" accessibilityLabel={L("Previous image", "上一张")} style={side(true)}><Icon name="back" size={18} tint="#ffffff" /></CarouselPrevious>
         <CarouselNext testID="image-next" accessibilityLabel={L("Next image", "下一张")} style={side(false)}><Icon name="chevron" size={18} tint="#ffffff" /></CarouselNext>
         <View style={{ position: "absolute", bottom: 8, alignSelf: "center", paddingHorizontal: 10, height: 24, borderRadius: 12, justifyContent: "center", backgroundColor: alpha("#000000", 0.45) }}>
-          <Text style={{ fontSize: 12, color: "#ffffff", fontVariant: ["tabular-nums"] }}>{`${index() + 1} / ${props.paths.length}`}</Text>
+          <Text style={{ fontSize: 12, color: "#ffffff", fontVariant: ["tabular-nums"] }}>{`${index() + 1} / ${props.urls.length}`}</Text>
         </View>
       </If>
     </Carousel>
@@ -1157,6 +1203,9 @@ function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry
   const over = signal(false);
   // a reply to an agent's message about a task quotes that message (the last one about it before this)
   const said = () => [...props.hub.events()].reverse().find((x) => x.ref === ref && x.ts <= e.ts && x.kind !== "owner" && !isHub(x.from));
+  // the message the preview shows: the card it answers, else the agent's message about the task
+  const original = () => (ref ? props.hub.events().find((x) => x.ref === ref && isAsk(x)) ?? said() : undefined);
+  const peek = signal(false);
   const asked = () => (ref ? askLine(props.hub.events().find((x) => x.ref === ref && isAsk(x))?.text ?? "") || (props.hub.status()?.decisions.find((d) => d.id === ref)?.question ?? "")
     || (/^T-/.test(ref) && said() ? `${displayName(said()!.from)}${L(": ", "：")}${firstLine(said()!.text)}` : "") : "");
   // "选 A" alone says little: the option's own words go under it, without the "A:" it already shows
@@ -1196,21 +1245,54 @@ function OwnerBubble(props: { hub: Hub; event: HubEvent; out?: Outgoing; onRetry
             <Text style={{ fontSize: size.tiny, fontWeight: "600", color: colors.danger }}>{L("Retry", "重试")}</Text>
           </View>
         </If>
-        {/* what this answers, quoted above the bubble (press: back to the card) */}
+        {/* what this answers, quoted above the bubble; press previews the original in place, "Go to message" scrolls there */}
         <If when={ref}>
-          <View
-            role="link"
-            testID={`reply-to-${ref}`}
-            onPress={() => props.onRef?.(ref!)}
-            hoverStyle={{ opacity: 1 }}
-            style={{ cursor: "pointer", opacity: 0.85, flexDirection: "row", alignItems: "center", gap: 6, maxWidth: "100%", paddingHorizontal: 4 }}
+          <Popover
+            open={peek()}
+            onOpenChange={(o) => peek.set(o.open)}
+            placement="bottom"
+            align="end"
+            offset={6}
+            margin={8}
+            trigger={
+              <View
+                role="button"
+                testID={`reply-to-${ref}`}
+                accessibilityLabel={L(`Preview ${ref}`, `预览 ${ref}`)}
+                hoverStyle={{ opacity: 1 }}
+                style={{ cursor: "pointer", opacity: peek() ? 1 : 0.85, flexDirection: "row", alignItems: "center", gap: 6, maxWidth: "100%", paddingHorizontal: 4 }}
+              >
+                <Icon name="reply" size={13} tint={colors.faint} />
+                <Text style={{ ...chipText, fontFamily: MONO, fontSize: 12, color: colors.muted }}>{ref}</Text>
+                <If when={asked()}>
+                  <Text style={{ ...chipText, flexShrink: 1, numberOfLines: 1, fontSize: 13, color: colors.faint }}>{asked()}</Text>
+                </If>
+              </View>
+            }
           >
-            <Icon name="reply" size={13} tint={colors.faint} />
-            <Text style={{ ...chipText, fontFamily: MONO, fontSize: 12, color: colors.muted }}>{ref}</Text>
-            <If when={asked()}>
-              <Text style={{ ...chipText, flexShrink: 1, numberOfLines: 1, fontSize: 13, color: colors.faint }}>{asked()}</Text>
-            </If>
-          </View>
+            {/* No padding on the card: the body scrolls edge to edge, so its scroll bar sits on the card's edge. */}
+            <PopIn style={[popupSurface(), { width: 400, maxWidth: "100%", padding: 0, overflow: "hidden" }]}>
+              <View testID={`reply-preview-${ref}`} style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingLeft: 14, paddingRight: 6, paddingVertical: 6, minHeight: 44, borderBottomWidth: 0.5, borderBottomColor: surfaceEdge() }}>
+                <If when={original()}>
+                  <Avatar from={original()!.from} small />
+                  <Text style={{ flexShrink: 1, fontSize: size.small, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{displayName(original()!.from)}</Text>
+                </If>
+                <Text style={{ fontFamily: MONO, fontSize: 12, color: colors.muted }}>{ref}</Text>
+                <If when={original()}>
+                  <Text style={{ fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>{timeOf(original()!.ts)}</Text>
+                </If>
+                <View style={{ flex: 1 }} />
+                <Button testID={`reply-goto-${ref}`} label={L("Go to message", "跳到原消息")} variant="ghost" size="sm" onPress={() => { peek.set(false); props.onRef?.(ref!); }} />
+              </View>
+              <Scroll style={{ maxHeight: 320 }}>
+                <View style={{ paddingHorizontal: 14, paddingTop: 10, paddingBottom: 12 }}>
+                  <If when={original()} else={<Text style={{ fontSize: size.small, color: colors.muted, userSelect: "text" }}>{asked() || L("The original message is no longer loaded.", "原消息已不在当前记录里。")}</Text>}>
+                    <Rich text={original()!.text} scale={0.9} />
+                  </If>
+                </View>
+              </Scroll>
+            </PopIn>
+          </Popover>
         </If>
         <If when={e.attachments?.length}>
           <View testID="owner-images" style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", alignItems: "flex-end", gap: 6, opacity: props.out ? 0.65 : 1 }}>
@@ -3940,7 +4022,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   /** The sheet covers only the conversation, keeping the navigation sidebar accessible. */
   const chatRoom = () => windowSize().width - (wide() && sidebarOpen() ? size.sidebar : 0);
   const readerSide = () => wide() && chatRoom() >= 860;
-  const readerWidth = () => Math.min(chatRoom(), resizedReaderWidth() ?? Math.max(360, Math.min(460, Math.round(chatRoom() * 0.42))));
+  // It opens at a reading width (about 70 characters of report text), leaving a strip of the chat to click back to.
+  const readerWidth = () => Math.min(chatRoom(), resizedReaderWidth() ?? Math.max(360, Math.min(READER_WIDTH, chatRoom() - 200)));
   const shownDoc = () => { const d = reading(); return d && d.at === readerAt() ? d : null; };
   /**
    * When the conversation was entered: reports already there stay closed (their cards and the header's button open
@@ -4204,6 +4287,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
     draft.set("");
     replyTo.set(null);
     attachments.set([]);
+    viewing.set(null);
     attachNote.set(null);
     inputHeight.set(28);
     send(v, r, undefined, files);
@@ -4211,6 +4295,9 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
 
   // Images the owner attaches: pasted, dropped on the window, or picked.
   const attachments = signal<Attachment[]>([]);
+  /** The thumbnail whose full-size view is open; it pages through every attached image. */
+  const viewing = signal<string | null>(null);
+  const viewingIndex = () => Math.max(0, attachments().findIndex((a) => a.id === viewing()));
   const attachNote = signal<string | null>(null);
   // A file drag over the window: null when none, else the offered files (empty until the shell reports them).
   const dropping = signal<string[] | null>(null);
@@ -4228,6 +4315,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   function unattach(id: string) {
     const a = attachments().find((x) => x.id === id);
     if (a) URL.revokeObjectURL(a.preview);
+    if (viewing() === id) viewing.set(null);
     attachments.update((list) => list.filter((x) => x.id !== id));
     attachNote.set(null);
   }
@@ -4506,7 +4594,13 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
   // Shortcuts. Single keys never fire while typing (`notEditing`).
   keymap.bind("mod+enter", submit, { when: "always" });
   keymap.bind("mod+k", () => composer?.focus(), { when: "always" });
-  keymap.bind("mod+z", () => { if (!draft()) undo(); }, { when: "always" });
+  // Mod+Z recalls a held message only while the draft is empty and one is held; otherwise the key stays with the
+  // composer, whose own undo / redo must keep working.
+  effect(() => {
+    if (draft() || !outbox().some((o) => o.state === "held")) return;
+    const off = keymap.bind("mod+z", () => { undo(); }, { when: "always" });
+    cleanup(off);
+  });
   keymap.bind("mod+,", openTeam, { when: "always" });
   keymap.bind("mod+b", () => setSidebarOpen(!untracked(sidebarOpen)), { when: "always" });
   keymap.bind("mod+shift+l", toggleTheme, { when: "always" });
@@ -4810,6 +4904,8 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                   paddingLeft: 18,
                   paddingRight: 8,
                   ...composerGlass(focused()),
+                  // The compact outline and its round controls share a center: radius + 4pt inset.
+                  ...(compactComposer() ? { borderRadius: corner.composerCompact } : {}),
                   ...(dropping() && onChannel() ? { borderColor: colors.accent, borderStyle: "dashed" as const } : {}),
                 }}
               >
@@ -4831,33 +4927,51 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                   )}
                 </If>
                 <If when={attachments().length}>
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, paddingTop: 2 }}>
-                    <Each of={attachments()} key={(a) => a.id}>
-                      {(a) => (
-                        <View testID="attachment" accessibilityLabel={a().name} style={{ width: 64, height: 64 }}>
-                          <Image
-                            src={a().preview}
-                            style={{ width: 64, height: 64, borderRadius: radius.inset, backgroundColor: colors.inset, objectFit: "cover" }}
-                          />
-                          <View
-                            testID="remove-attachment"
-                            role="button"
-                            accessibilityLabel={L(`Remove ${a().name}`, `移除 ${a().name}`)}
-                            tooltip={touch ? undefined : <Tooltip label={L("Remove", "移除")} />}
-                            onPress={() => unattach(a().id)}
-                            hoverStyle={{ opacity: 0.85 }}
-                            style={{
-                              position: "absolute", top: -6, right: -6, width: 22, height: 22, borderRadius: 11,
-                              alignItems: "center", justifyContent: "center",
-                              backgroundColor: colors.text,
-                            }}
-                          >
-                            <Icon name="close" size={10} tint={colors.background} />
+                  <>
+                    <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, paddingTop: 2 }}>
+                      <Each of={attachments()} key={(a) => a.id}>
+                        {(a) => (
+                          <View testID="attachment" style={{ width: 64, height: 64 }}>
+                            <View
+                              role="button"
+                              accessibilityLabel={L(`View ${a().name}`, `查看 ${a().name}`)}
+                              onPress={() => viewing.set(a().id)}
+                              style={{ width: 64, height: 64, cursor: "pointer" }}
+                            >
+                              <Image
+                                src={a().preview}
+                                style={{ width: 64, height: 64, borderRadius: radius.inset, backgroundColor: colors.inset, objectFit: "cover" }}
+                              />
+                            </View>
+                            <View
+                              testID="remove-attachment"
+                              role="button"
+                              accessibilityLabel={L(`Remove ${a().name}`, `移除 ${a().name}`)}
+                              tooltip={touch ? undefined : <Tooltip label={L("Remove", "移除")} />}
+                              onPress={() => unattach(a().id)}
+                              hoverStyle={{ opacity: 0.85 }}
+                              style={{
+                                position: "absolute", top: -6, right: -6, width: 22, height: 22, borderRadius: 11,
+                                alignItems: "center", justifyContent: "center",
+                                backgroundColor: colors.text,
+                              }}
+                            >
+                              <Icon name="close" size={10} tint={colors.background} />
+                            </View>
                           </View>
-                        </View>
-                      )}
-                    </Each>
-                  </View>
+                        )}
+                      </Each>
+                    </View>
+                    <Dialog
+                      open={viewing() != null}
+                      animation="fade"
+                      onOpenChange={({ open }) => !open && viewing.set(null)}
+                      backdropClass="bg-scrim"
+                      style={{ flex: 1, padding: 24, pointerEvents: "box-none" }}
+                    >
+                      <ImagePager urls={attachments().map((a) => a.preview)} start={viewingIndex} onClose={() => viewing.set(null)} />
+                    </Dialog>
+                  </>
                 </If>
                 <If when={attachNote()}>
                   {(note) => <Text testID="attach-note" style={{ fontSize: 13, color: colors.danger }}>{note()}</Text>}
@@ -4898,7 +5012,7 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
                   }}
                 />
                 {/* Keep the toolbar and its buttons in one place in the tree as the field expands. */}
-                <View style={{ position: "absolute", left: 18, right: 8, bottom: compactComposer() ? 4 : 8, flexDirection: "row", alignItems: "center", gap: 8, pointerEvents: "box-none" }}>
+                <View style={{ position: "absolute", left: compactComposer() ? 12 : 18, right: compactComposer() ? 4 : 8, bottom: compactComposer() ? 4 : 8, flexDirection: "row", alignItems: "center", gap: 8, pointerEvents: "box-none" }}>
                   <View style={{ flex: 1, flexDirection: "row", alignItems: "center", gap: 6, minWidth: 0, pointerEvents: "box-none" }}>
                     <View
                       testID="attach"
@@ -4978,7 +5092,10 @@ function Chat(props: { hub: Hub; openRef?: string | null; onConnection: () => vo
       accessibilityLabel={L(`${p.folded.title}, back to the top`, `${p.folded.title}，回到顶部`)}
       onPress={() => p.folded.reveal()}
       style={p.stacked
-        ? { minWidth: 0, maxWidth: "100%", alignItems: platform.os === "ios" ? "center" : "flex-start" }
+        // Native header slots are measured at intrinsic width, so a percentage
+        // alone cannot constrain them. Reserve 80pt per side for bar controls
+        // and their margins, including when an iPad shows the sidebar.
+        ? { width: Math.max(0, chatRoom() - 160), minWidth: 0, alignItems: platform.os === "ios" ? "center" : "flex-start", overflow: "hidden" }
         : { flexShrink: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 8 }}
     >
       <Text style={{ flexShrink: 1, minWidth: 0, maxWidth: "100%", fontSize: 16, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{p.folded.title}</Text>

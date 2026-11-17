@@ -24,6 +24,35 @@ export type Result = {
   followups?: { title: string; body?: string; agent?: string; priority?: string; repo?: string; requires?: string; host?: string }[];
 };
 
+export type RunLimits = {
+  totalMinutes: number;
+  workMinutes: number;
+  checkpointMinutes: number;
+  checkpointAt: string;
+  hardAt: string;
+};
+
+export function runLimits(cfg: Cfg, started = Date.now()): RunLimits {
+  const totalMinutes = Math.max(1, Number(cfg.clis?.timeout_minutes) || 60);
+  const configured = Number(cfg.clis?.checkpoint_minutes);
+  const requested = Number.isFinite(configured) ? Math.max(0, configured) : (totalMinutes >= 30 ? 10 : 0);
+  const checkpointMinutes = Math.min(Math.max(0, totalMinutes - 5), requested);
+  const workMinutes = totalMinutes - checkpointMinutes;
+  return {
+    totalMinutes, workMinutes, checkpointMinutes,
+    checkpointAt: new Date(started + workMinutes * 60_000).toISOString(),
+    hardAt: new Date(started + totalMinutes * 60_000).toISOString(),
+  };
+}
+
+export function deadlinePrompt(limits: RunLimits): string {
+  const reserve = limits.checkpointMinutes
+    ? `The final ${limits.checkpointMinutes} minutes are reserved for emergency checkpoint recovery; the process is stopped at ${limits.hardAt}.`
+    : `The process is stopped at ${limits.hardAt}.`;
+  return `The task has a ${limits.totalMinutes}-minute hard limit. Finish normally or return a structured result before ${limits.checkpointAt}.
+If work may outlive that checkpoint deadline, save durable progress first, then return \`waiting\` with a quick read-only \`wait_check\` whose exit code changes when the wait is over. ${reserve}`;
+}
+
 const RESULT_SPEC = () => `Finish the work, then end your final reply with EXACTLY one fenced \`\`\`json block:
 {
   "status": "done" | "needs_decision" | "failed" | "delegated" | "waiting",   // delegated = you split the work into followups and want to be woken up to consolidate when they finish; waiting = see below
@@ -42,11 +71,11 @@ const RESULT_SPEC = () => `Finish the work, then end your final reply with EXACT
 }
 Write summary, question and options in the owner's language (${L("English", "Simplified Chinese")} unless the owner writes otherwise), plain text, no emoji; keep identifiers, links and code as they are.
 Only use needs_decision after doing all preparation that does not depend on the answer.
-Never sit idle waiting on something slow (GitHub Actions/CI, a release, a review, a deploy): if the next step needs it, return "waiting" with waiting_on, wait_minutes and wait_check.
+Never sit idle waiting on something slow (GitHub Actions/CI, a release, a review, a deploy): if the next step needs it, return "waiting" with waiting_on, wait_minutes and wait_check. If the PR's workflow runs are held for "Approve and run" (gh run list shows status waiting / action_required, gh pr checks shows nothing), CI will never start by itself: return wait_kind "human" and say in waiting_on that the owner must approve the run, with the PR link.
 Before returning "waiting", do every part of the task that does not depend on the condition (other platforms, docs, tests, screenshots, the next PR): implement and let CI verify rather than wait for a host. Waiting on another PR to merge is not a reason to stop: build on its branch or merge it locally, and note the dependency.
 The machine then runs other work and wakes you later with your notes; check the condition first, then continue from where you left off.`;
 
-export function buildPrompt(meta: Record<string, string>, body: string, cfg: Cfg, resourceNote = ""): string {
+export function buildPrompt(meta: Record<string, string>, body: string, cfg: Cfg, resourceNote = "", limits = runLimits(cfg)): string {
   const agent = meta.agent || "lead";
   const host = meta.claimed_by || "?";
   return `You are **${agentName(agent)}**, a permanent member of ${cfg.owner?.name ?? "the owner"}'s AI agent fleet, running headless on host \`${host}\`.
@@ -83,6 +112,9 @@ Outside the hub you are Noop: never use your agent name (${agentName(agent)}) or
 # Resource budget
 ${resourceNote}
 
+# Run deadline
+${deadlinePrompt(limits)}
+
 ${channelPrompt()}
 
 # Task ${meta.id}: ${meta.title}
@@ -103,11 +135,12 @@ function rosterLine(): string {
     }).join("\n");
 }
 
-/** workspace-write only covers the cwd and /tmp; agents also need project checkouts, scratch, the hub and cargo's caches.
+/** workspace-write only covers the cwd and /tmp; agents also need project checkouts, scratch, the hub, its feed
+ *  (where `noop notify` appends) and cargo's caches.
  *  `workDirs` is the owner's `[resources].work_dirs`: wherever they keep their repos, not only the default `~/work`. */
-export function codexWritableDirs(home = homedir(), workDirs: string[] = []): string[] {
+export function codexWritableDirs(home = homedir(), workDirs: string[] = [], root = ROOT): string[] {
   const configured = workDirs.map((d) => d.replace(/^~/, home));
-  const dirs = [join(home, "work"), join(home, ".noop", "work"), join(home, ".agent-hub", "work"), ROOT, join(home, ".cargo"), ...configured];
+  const dirs = [join(home, "work"), join(home, ".noop", "work"), join(home, ".agent-hub", "work"), root, join(root, "..", "feed"), join(home, ".cargo"), ...configured];
   const real = dirs.filter((d) => existsSync(d)).map((d) => realpathSync(d));
   return [...new Set(real)];
 }
@@ -175,8 +208,10 @@ export function stripImages(line: string): string {
 /** A run that died before reaching the provider — no tokens spent, no tool ran, so it is safe to spawn again. */
 const UNREACHABLE = /Can't reach the API server|connection_failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|getaddrinfo/i;
 
-/** Marker runAgent appends when it stopped a run that went quiet (see stall_minutes). */
+/** Marker for a quiet process that should use the bounded stall-retry path. */
 export const STALLED = "\n[stalled]";
+/** Marker for a process stopped at its work deadline so the caller can run checkpoint recovery. */
+export const RUN_LIMIT = "\n[run-limit]";
 
 /** `retryEmpty` is internal: an empty completion gets exactly one rerun (see the end of the function). */
 export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cfg, logFile: string, gateOverride = false,
@@ -251,7 +286,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   };
 
   let stalled = false, timedOut = false;
-  // hitting the run limit is not a tooling fault: report it like a stall so the task continues where it got to
+  // A work deadline is a checkpoint signal, not a quiet-process stall: the caller gets the reserved recovery window.
   const timer = setTimeout(() => { timedOut = true; proc.kill(); }, timeoutMs);
   // a run that has gone quiet: no output at all, and nothing slow in flight (a sub-agent may work quietly for long)
   const watch = setInterval(() => {
@@ -266,7 +301,7 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
   const logged = json ? raw.split("\n").map(stripImages).join("\n") : raw;
   writeFileSync(logFile, `$ ${cmd.join(" ")}\n(exit ${code})\n\n${logged}\n\n[stderr]\n${err}`);
   const out = json ? (resultText ?? assistantText) : raw;
-  if (timedOut) return `${out}${STALLED} hit the ${Math.round(timeoutMs / 60_000)}-minute run limit (clis.timeout_minutes)${act.step ? `; last step: ${act.step}` : ""}; run long builds in the background and return "waiting"`;
+  if (timedOut) return `${out}${RUN_LIMIT} hit the ${Math.round(timeoutMs / 60_000)}-minute work limit${act.step ? `; last step: ${act.step}` : ""}`;
   if (stalled) return `${out}${STALLED} no output for ${Math.round(stallMs / 60_000)} minutes${act.step ? `; last step: ${act.step}` : ""}`;
   // A provider occasionally answers with an empty completion (no text, no tool call, exit 0) and Claude Code's own
   // "no visible output" retry gets nothing either. That is a flake of the tool chain, not the task failing: rerun the
@@ -292,31 +327,48 @@ export async function runAgent(cli: string, prompt: string, cwd: string, cfg: Cf
 export function parseResult(out: string): Result {
   const blocks = [...out.matchAll(/```json\s*(\{[\s\S]*?\})\s*```/g)].map((m) => m[1]).reverse();
   for (const b of blocks) {
-    for (const text of [b, escapeRawControlChars(b)]) {
-      try {
-        const r = JSON.parse(text);
-        if (r.status) return r;
-      } catch {}
+    for (const text of [b, repairJson(b)]) {
+      const r = parsed(text);
+      if (r) return r;
     }
   }
   // codex (and others) sometimes end the reply with a bare JSON object instead of a fenced block
   const bare = out.match(/\{[\s\S]*\}/);
   if (bare) {
-    try {
-      const r = JSON.parse(bare[0]);
-      if (r.status) return r;
-    } catch {}
+    const r = parsed(bare[0]) ?? parsed(repairJson(bare[0]));
+    if (r) return r;
   }
   return { status: "failed", summary: `agent returned no result block. tail: ${out.slice(-300)}` };
 }
 
-/** Models occasionally put a literal line break inside a JSON string. Keep the text, make the block parseable. */
-function escapeRawControlChars(json: string): string {
+function parsed(text: string): Result | null {
+  try {
+    const r = JSON.parse(text);
+    return r?.status ? r : null;
+  } catch { return null; }
+}
+
+/** Models occasionally put a literal line break, a bare `"` or a lone backslash inside a JSON string. Keep the text, make the block parseable.
+ * A `"` inside a string is a stray quote unless the next non-space character can follow a value (`:`, `,`, `}`, `]`, end). */
+function repairJson(json: string): string {
   let out = "", inString = false, escaped = false;
-  for (const c of json) {
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i];
     if (escaped) { out += c; escaped = false; continue; }
-    if (c === "\\") { out += c; escaped = true; continue; }
-    if (c === '"') { out += c; inString = !inString; continue; }
+    if (c === "\\") {
+      // a lone backslash, e.g. a Windows path like `D:\`, is not a JSON escape: keep it as a literal backslash
+      if (inString && !/["\\/bfnrtu]/.test(json[i + 1] ?? "")) { out += "\\\\"; continue; }
+      out += c; escaped = true; continue;
+    }
+    if (c === '"') {
+      if (!inString) { inString = true; out += c; continue; }
+      let j = i + 1;
+      while (j < json.length && /\s/.test(json[j])) j++;
+      const next = json[j] ?? "";
+      if (next === "" || next === "," || next === ":" || next === "}" || next === "]") { inString = false; out += c; }
+      else out += '\\"';
+      continue;
+    }
     if (inString && c === "\n") out += "\\n";
     else if (inString && c === "\r") out += "\\r";
     else if (inString && c === "\t") out += "\\t";

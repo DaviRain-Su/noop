@@ -10,29 +10,30 @@ import {
 } from "./core";
 import { amendDecision, closeDecision, IGNORE, ignoreDecision, openDecision, overrideJudge, ownerPickedMenu, recentJudgeIds, routeDecision } from "./decisions";
 import { notify, openDecisionIds, pollReplies } from "./notify";
-import { STALLED, type Result, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent } from "./runner";
+import { RUN_LIMIT, STALLED, type Result, agentProcs, ask, buildPrompt, parseResult, quickAsk, runAgent, runLimits } from "./runner";
 import { writeRules } from "./rules";
-import { backoffMinutes, CHECKED_FALLBACK_MIN, isNoChangeRoutine, tooManyWakes, waitMeta } from "./waits";
-import { allowedParallel, budget, canRunHeavy, ensureDisk, sample } from "./resources";
+import { backoffMinutes, CHECKED_FALLBACK_MIN, isNoChangeRoutine, MAX_WAKES, tooManyWakes, waitMeta } from "./waits";
+import { allowedParallel, budget, canRunHeavy, ensureDisk, pressureOf, sample } from "./resources";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import { init, install, selfUpdate } from "./setup";
 import { computeMetrics } from "./metrics";
 import { writeUsageReport } from "./usage-report";
-import { supervise } from "./supervisor";
+import { checkUnrunnable, supervise } from "./supervisor";
 import { collect, LEARN_PROMPT } from "./sessions";
 import { medic } from "./medic";
 import { githubStarved } from "./github";
 import { doctor, visual } from "./visual";
-import { answerFromChat, appendEvent, cancelTask, drainInbound, feed, handleOwnerMessage, mediaDays, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
+import { ackInbound, answerFromChat, appendEvent, cancelTask, feed, handleOwnerMessage, mediaDays, pendingInbound, pruneMedia, recentChat, setApplyOp, setCancelTask, setUpdateFleet, onSettingsSaved, startServer, status as hubStatus } from "./server";
 import { addFollowUp, reopenTask, routeWithoutModel, type BrainOut, ClaudeModel, systemPrompt, dataActs, localStore, logBrain, think } from "./brain";
 import { isWrite, runTool } from "../cloud/src/tools";
 import { cloudDeploy, startCloudBridge } from "./cloud";
 import { adoptCloudUrl, readHubToml } from "./sync";
-import { judgeAccuracy, level, needsApproval, noteStuckRoutine, proposeBatch, resolveProposals, routineQueued, supersedeProposed } from "./autonomy";
+import { judgeAccuracy, level, needsApproval, noteStuckRoutine, proposeBatch, resolveProposals, routineParkedOnDecision, routineQueued, supersedeProposed } from "./autonomy";
 import { CODE, L, UPDATE_REQUEST, type UpdateState, setUpdateState, updateState, allowedClis, cliHintPatch, capOk, idTagFor, isPrimary, runningRev, setApprovalGate, setIdTag } from "./core";
 import { accountEnv, accountsStatus, classify, failoverAccount, pendingLoginIds, pickAccount, reportFailure, retryLogins, submitLoginCode } from "./accounts";
 import { channelPrompt, channels, resolveChannels, updateChannel } from "./channels";
+import { shellBash } from "./shell";
 
 // ------------------------------------------------------------------ routines (scheduled task generators)
 const STATE = P("logs", "routine-state.json");
@@ -60,7 +61,7 @@ export function due(every: string, last: string | undefined, t = new Date()): bo
 export function signalChanged(r: { name: string; signal?: string }, state: Record<string, string>): boolean {
   const key = `${r.name}#signal`;
   // Non-login: the service already carries the user's PATH, and sourcing their profile can cost seconds (conda, etc.).
-  const res = Bun.spawnSync(["bash", "-c", r.signal!], { cwd: existsSync(ROOT) ? ROOT : undefined, stdout: "pipe", stderr: "pipe", timeout: 60_000 });
+  const res = Bun.spawnSync([shellBash(), "-c", r.signal!], { cwd: existsSync(ROOT) ? ROOT : undefined, stdout: "pipe", stderr: "pipe", timeout: 60_000 });
   if (res.exitCode !== 0) return true;
   const hash = new Bun.CryptoHasher("sha1").update(res.stdout).digest("hex");
   if (state[key] === hash) return false;
@@ -101,6 +102,18 @@ function runRoutines(cfg: Cfg, host: string, primary: boolean) {
       state[r.name] = new Date().toISOString();
       journal(host, `⏰ routine \`${r.name}\` skipped: ${queued} still queued/running`);
       noteStuckRoutine(cfg, r.name, queued, state);
+      continue;
+    }
+    // opt-in: a copy already parked on an unanswered decision would only be repeated by every later run
+    const parked = r.skip_while_decision_open ? routineParkedOnDecision(r.name, pin) : "";
+    if (parked) {
+      state[r.name] = new Date().toISOString();
+      // once per parked copy, not once per skipped tick: a 10m routine would otherwise fill the journal with the same line
+      const key = `${r.name}#parked`;
+      if (state[key] !== parked) {
+        state[key] = parked;
+        journal(host, `⏰ routine \`${r.name}\` skipped: ${parked} waits on the owner's answer`);
+      }
       continue;
     }
     if (r.signal && !signalChanged(r, state)) { state[r.name] = new Date().toISOString(); continue; } // nothing new → no AI run
@@ -154,9 +167,55 @@ async function processTask(path: string, cfg: Cfg, host: string) {
     const gh = await githubStarved(cfg);
     const b = budget(sample(cfg), running, meta.weight === "heavy");
     b.note += gh.note ? `\n${gh.note}` : "";
-    out = await runAgent(cli, buildPrompt(meta, promptBody, cfg, b.note), meta.repo || P(), cfg, log, !!meta.gate_override,
+    const limits = runLimits(cfg);
+    const workCfg = limits.checkpointMinutes
+      ? { ...cfg, clis: { ...cfg.clis, timeout_minutes: limits.workMinutes } }
+      : cfg;
+    out = await runAgent(cli, buildPrompt(meta, promptBody, cfg, b.note, limits), meta.repo || P(), workCfg, log, !!meta.gate_override,
       { ...b.env, ...accountEnv(acct) });
     if (cancelled.has(meta.id)) { cancelled.delete(meta.id); return; } // the owner cancelled it while it ran
+    if (out.includes(RUN_LIMIT)) {
+      const partial = parseResult(out.slice(0, out.indexOf(RUN_LIMIT)));
+      if (partial.status !== "failed") { res = partial; break; }
+      const limitHits = recordRunLimit(meta);
+      if (tooManyWakes(limitHits)) {
+        res = { status: "failed", summary: L(
+          `The task reached its work limit ${limitHits} times; stopped after the ${MAX_WAKES}-resume safety cap`,
+          `任务已 ${limitHits} 次达到工作时限；超过 ${MAX_WAKES} 次恢复的安全上限，已停止`,
+        ) };
+        break;
+      }
+      if (limits.checkpointMinutes) {
+        await locked(async () => {
+          journal(host, L(`💾 ${meta.id} work window ended; saving a checkpoint`, `💾 ${meta.id} 工作窗口结束，开始保存检查点`));
+          await _commitPush(`[${host}] checkpoint ${meta.id}`);
+        });
+        const checkpointLog = P("logs", "runs", `${meta.id}-${Date.now()}-${cli}-checkpoint.log`);
+        const hardAt = Date.parse(limits.hardAt);
+        const remainingMinutes = Math.max(0.1, (hardAt - Date.now()) / 60_000);
+        const resumeAt = hardAt + 5 * 60_000;
+        const resumeMinutes = Math.max(5, Math.ceil((resumeAt - Date.now()) / 60_000));
+        const checkpointCfg = { ...cfg, clis: { ...cfg.clis, timeout_minutes: remainingMinutes } };
+        const checkpointBody = checkpointRecoveryBody(promptBody, log, resumeAt, resumeMinutes);
+        const checkpointLimits = {
+          totalMinutes: remainingMinutes,
+          workMinutes: remainingMinutes,
+          checkpointMinutes: 0,
+          checkpointAt: limits.hardAt,
+          hardAt: limits.hardAt,
+        };
+        const checkpointOut = await runAgent(cli, buildPrompt(meta, checkpointBody, checkpointCfg, b.note, checkpointLimits),
+          meta.repo || P(), checkpointCfg, checkpointLog, !!meta.gate_override, { ...b.env, ...accountEnv(acct) });
+        if (cancelled.has(meta.id)) { cancelled.delete(meta.id); return; }
+        const checkpoint = parseResult(checkpointOut);
+        if (checkpoint.status !== "failed" && (checkpoint.status !== "waiting" || checkpoint.wait_check)) {
+          res = checkpoint;
+          break;
+        }
+      }
+      res = checkpointFallback(meta.id, log);
+      break;
+    }
     if (out.includes(STALLED)) { // went quiet and was stopped: run it again from where it got to, up to twice
       const why = out.slice(out.indexOf(STALLED) + STALLED.length).trim();
       const stalls = Number(meta.stalls ?? 0) + 1;
@@ -262,6 +321,27 @@ async function processTask(path: string, cfg: Cfg, host: string) {
   });
 }
 
+export function checkpointFallback(id: string, log: string, resumeAt = Date.now() + 5 * 60_000): Result {
+  return {
+    status: "waiting",
+    wait_kind: "ci",
+    wait_minutes: 5,
+    wait_check: `test "$(date +%s)" -ge ${Math.floor(resumeAt / 1000)}`,
+    waiting_on: `checkpoint saved after the work limit; resume ${id} from ${log}`,
+    summary: `The work window ended before a structured checkpoint was returned. The transcript is preserved at ${log}; resume by inspecting the existing branch and checkout instead of repeating completed work.`,
+  };
+}
+
+export function checkpointRecoveryBody(body: string, log: string, resumeAt: number, resumeMinutes: number): string {
+  return `${body}\n\n# Checkpoint-only recovery\nThe main work window ended. Do not continue broad implementation. Inspect ${log} and the current checkout, preserve all durable progress (including a commit on the existing agent branch when appropriate), and return a structured result. Prefer \`waiting\` with the real external condition's read-only \`wait_check\`. If there is no external condition, use \`wait_kind: "ci"\`, \`wait_minutes: ${resumeMinutes}\`, and \`wait_check: "test \"$(date +%s)\" -ge ${Math.floor(resumeAt / 1000)}"\` so the daemon resumes from the saved checkpoint instead of rerunning immediately.`;
+}
+
+export function recordRunLimit(meta: Record<string, string>): number {
+  const hits = Number(meta.run_limits ?? 0) + 1;
+  meta.run_limits = String(hits);
+  return hits;
+}
+
 /** The followups this run may spawn: the array the result spec asks for, minus entries with no usable title.
  *  The model writes this JSON, so an entry can be a bare string, `null`, or a body with no title at all — spawning it
  *  would write a task whose title is undefined (and used to abort the whole run inside writeDoc). */
@@ -276,10 +356,17 @@ export const followupsOf = (res: ReturnType<typeof parseResult>, limit: number):
 
 const FOLLOW_UP = "## Owner follow-up";
 
+/** Chat answers are dropped from the on-disk queue only after the loop: a restart mid-loop hands them to the next daemon
+ * (a card already answered is not answered twice), and one that throws is not replayed every tick. */
 async function handleReplies(cfg: Cfg, host: string) {
+  const queued = pendingInbound();
+  try { await answerReplies(cfg, host, queued); } finally { ackInbound(queued.length); }
+}
+
+async function answerReplies(cfg: Cfg, host: string, queued: ReturnType<typeof pendingInbound>) {
   const open = openDecisionIds();
   const judged = recentJudgeIds();
-  const replies = [...drainInbound(), ...await pollReplies(cfg, new Set([...open, ...judged, ...pendingLoginIds()]))];
+  const replies = [...queued, ...await pollReplies(cfg, new Set([...open, ...judged, ...pendingLoginIds()]))];
   for (const r of replies) {
     if (r.id.startsWith("P-")) {
       if (resolveProposals(r.id, r.answer, `owner(${r.source})`)) {
@@ -493,7 +580,7 @@ function wakeParents(host: string, ready = new Set<string>()) {
         void notify(L(`${meta.id} is stuck: ${meta.waiting_on ?? "?"} (woken ${wakes} times, no more automatic retries)`, `${meta.id} 卡住了：${meta.waiting_on ?? "?"}（已唤醒 ${wakes} 次，不再自动重试）`), loadConfig(), { kind: "notice", ref: meta.id });
         continue;
       }
-      writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, wake_at: undefined, wait_kind: undefined, status: undefined, claimed_by: undefined, resumed: "yes", wakes: String(wakes) },
+      writeDoc(P("tasks", "inbox", `${meta.id}.md`), { ...meta, wake_at: undefined, wait_kind: undefined, wait_ready: undefined, status: undefined, claimed_by: undefined, resumed: "yes", wakes: String(wakes) },
         `${body}\nResumed after waiting on: ${meta.waiting_on ?? "?"}. Check it now; if still not ready, return "waiting" again.\n`);
       unlinkSync(p);
       journal(host, L(`⏰ ${meta.id} wait over, requeued to check`, `⏰ ${meta.id} 等待结束，重新排队检查`));
@@ -519,13 +606,33 @@ const runningIds = new Set<string>();
 /** Waits with a wait_check: the daemon runs it itself (no agent) with backoff 5 → 10 → 20 → 40 minutes; once its exit
  * code differs from the first run, the wait is over. Human waits are checked too: that is how an event (PR merged) wakes them. */
 const waitChecks = new Map<string, { cmd: string; base?: number; next: number; n: number }>();
-export async function checkWaits(now = Date.now(), everyMs?: number): Promise<Set<string>> {
+/** The host that parked a wait (it ran there), from the host_caps it recorded. */
+export const waitHost = (meta: Record<string, string | undefined>) => (meta.host_caps ?? "").split(",").find((c) => c.startsWith("host:"))?.slice(5);
+/** Which host runs a wait's check: the host that parked it always does (its local paths, Xcode, files only exist there);
+ * the primary runs every other check it can run itself. A non-primary host marks its finished waits wait_ready for the primary. */
+export function runsCheckHere(meta: Record<string, string | undefined>, host?: string, primary = true, primaryOs = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux"): boolean {
+  const owner = waitHost(meta);
+  if (host && owner === host) return true;
+  return primary && !checkUnrunnable(meta.wait_check, primaryOs);
+}
+/** Non-primary hosts hand a finished wait to the primary through the synced task file. */
+function markWaitsReady(ids: Set<string>) {
+  for (const id of ids) {
+    const p = P("tasks", "waiting", `${id}.md`);
+    if (!existsSync(p)) continue;
+    const { meta, body } = readDoc(p);
+    if (meta.wait_ready !== "yes") writeDoc(p, { ...meta, wait_ready: "yes" }, body);
+  }
+}
+export async function checkWaits(now = Date.now(), everyMs?: number, host?: string, primary = true): Promise<Set<string>> {
   const ready = new Set<string>();
   const due: [string, string, string][] = [];
   const waiting = new Set<string>();
   for (const p of list(P("tasks", "waiting"), /^T-.*\.md$/)) {
     const { meta } = readDoc(p);
+    if (meta.wait_ready === "yes") { ready.add(meta.id); continue; } // another host saw its check change
     if (!(meta.wake_at || meta.wait_kind) || !meta.wait_check) continue;
+    if (host !== undefined && !runsCheckHere(meta, host, primary)) continue;
     waiting.add(meta.id);
     const c = waitChecks.get(meta.id);
     if (c && c.cmd === meta.wait_check && c.next > now) continue;
@@ -533,7 +640,7 @@ export async function checkWaits(now = Date.now(), everyMs?: number): Promise<Se
   }
   await Promise.all(due.map(async ([id, cmd, path]) => {
     // Non-login: the service already carries the user's PATH, and sourcing their profile can cost seconds (conda, etc.).
-    const proc = Bun.spawn(["bash", "-c", cmd], { stdout: "ignore", stderr: "ignore", cwd: homedir() });
+    const proc = Bun.spawn([shellBash(), "-c", cmd], { stdout: "ignore", stderr: "ignore", cwd: homedir() });
     const timer = setTimeout(() => proc.kill(), 60_000);
     const code = await proc.exited;
     clearTimeout(timer);
@@ -550,7 +657,9 @@ export async function checkWaits(now = Date.now(), everyMs?: number): Promise<Se
       else if (doc) writeDoc(path, { ...doc.meta, wait_check_base: `${code} ${cmd}` }, doc.body);
     }
     waitChecks.set(id, { cmd, base: base ?? code, next: now + (everyMs ?? backoffMinutes(n) * 60_000), n });
-    if (base !== undefined && code !== base) { ready.add(id); waitChecks.delete(id); }
+    if (base !== undefined && code !== base) {
+      ready.add(id); waitChecks.delete(id);
+    }
   }));
   for (const id of waitChecks.keys()) if (!waiting.has(id)) waitChecks.delete(id);
   return ready;
@@ -564,6 +673,10 @@ const inQuietHours = (cfg: Cfg) => {
   const cur = new Date().toTimeString().slice(0, 5);
   return a < b ? cur >= a && cur < b : cur >= a || cur < b;
 };
+
+/** Did this task end in a decision card (open or already answered)? Decision cards carry the id of the task that raised them. */
+const raisedDecision = (taskId: string) =>
+  ["open", "closed"].some((dir) => list(P("decisions", dir)).some((p) => readDoc(p).meta.task === taskId));
 
 export function maybeProposeNext(cfg: Cfg, host: string, state: Record<string, string>) {
   if (cfg.idle?.enabled === false || inQuietHours(cfg)) return;
@@ -579,11 +692,16 @@ export function maybeProposeNext(cfg: Cfg, host: string, state: Record<string, s
     .sort((a, b) => Date.parse(b.created) - Date.parse(a.created))[0];
   const cooldown = (cfg.idle?.cooldown_minutes ?? 180) * 60_000;
   if (pendingMenu && Date.now() - Date.parse(pendingMenu.created) < cooldown) return;
-  if (state.last_menu && Date.now() - Date.parse(state.last_menu) < 15 * 60_000) return;
+  const sinceLast = state.last_menu ? Date.now() - Date.parse(state.last_menu) : Infinity;
+  if (sinceLast < 15 * 60_000) return;
+  // The cooldown above only covers a menu card that is still open. A run that found nothing worth asking raises no card,
+  // so without this the next run fires every 15 minutes, each one a full model run that again answers "nothing new".
+  if (sinceLast < cooldown && state.last_idle_task && !raisedDecision(state.last_idle_task)) return;
   const id = newTask("Propose next actions (fleet idle)", `The fleet has been idle for ${Math.round(idleMin)} minutes.
 Build the owner's next-action menu per your profile and return needs_decision.${pendingMenu ? `\nAn earlier menu ${pendingMenu.id} is still unanswered — refresh it (drop stale items) rather than repeating it verbatim.` : ""}`,
     { agent: "chief-of-staff", priority: "high", source: "idle", extra: { kind: "menu" } });
   state.last_menu = new Date().toISOString();
+  state.last_idle_task = id;
   journal(host, `💤 fleet idle ${Math.round(idleMin)}m → ${id} chief-of-staff drafting a next-steps menu`);
 }
 
@@ -611,7 +729,8 @@ function maybeSupervise(cfg: Cfg, host: string) {
 export async function tick(cfg: Cfg, background = false) {
   const host = hostName(cfg);
   const primary = isPrimary(cfg, host);
-  const ready = primary ? await checkWaits().catch(() => new Set<string>()) : new Set<string>();
+  // Every host runs the checks of waits it parked (local files, Xcode); the primary also runs the rest.
+  const ready = await checkWaits(Date.now(), undefined, host, primary).catch(() => new Set<string>());
   await locked(async () => {
     await _pull();
     try { writeRules(); } catch (e) { console.error(`rules.md: ${e}`); }
@@ -623,7 +742,10 @@ export async function tick(cfg: Cfg, background = false) {
       maybeSupervise(cfg, host);
       await proposeBatch(cfg, host);
       noteUnservable(cfg, host);
-    } else reapStale(cfg, host, true);
+    } else {
+      reapStale(cfg, host, true);
+      markWaitsReady(ready); // the primary wakes them on its next tick
+    }
     await _commitPush(`[${host}] tick`);
   });
   pruneMediaHourly(cfg);
@@ -651,7 +773,7 @@ export async function tick(cfg: Cfg, background = false) {
     if (running >= max) break;
     if (!pickAccount(cfg, ["claude", "codex"].filter((c) => Bun.which(c)))) break;
     if ((await githubStarved(cfg)).starved && list(P("tasks", "inbox"), /^T-.*\.md$/).every((p) => GH_HEAVY.has(readDoc(p).meta.agent))) break;
-    const t = pickTask(cfg, s.loadRatio, canRunHeavy(s, cfg, running));
+    const t = pickTask(cfg, pressureOf(s), canRunHeavy(s, cfg, running));
     if (!t) break;
     const active = await claim(t, host);
     if (!active) { if (tried.has(t)) break; tried.add(t); continue; } // e.g. offline: don't spin on the same task
